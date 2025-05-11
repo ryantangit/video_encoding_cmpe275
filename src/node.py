@@ -1,5 +1,6 @@
 import grpc
 import asyncio
+import aiofiles
 import argparse
 import logging
 import os
@@ -12,7 +13,6 @@ import video_encode_pb2
 import video_encode_pb2_grpc
 import video_transfer_pb2
 import video_transfer_pb2_grpc
-
 
 
 class VideoTransferImplService(video_transfer_pb2_grpc.VideoTransferServiceServicer):
@@ -35,11 +35,10 @@ class VideoTransferImplService(video_transfer_pb2_grpc.VideoTransferServiceServi
             async for chunk in request_iterator:
                 fp.write(chunk.video_data)
         
-        # FFMPEG to segment a video into multiple clips
-        segment_dir = f"{filepath}/{first_chunk.video_name}_segments/" 
+        # FFMPEG to segment a video into multiple clips. Change segment_time for different lengths
+        segment_dir = f"{self.node.directory}/{first_chunk.video_name}_segments/" 
         os.makedirs(segment_dir, exist_ok=True)
-
-        output_pattern = os.path.join(segment_dir, 'output_%04d.mp4')
+        output_pattern = os.path.join(segment_dir, 'segment%04d.mp4')
         ffmpeg.input(filepath).output(
             output_pattern, 
             f="segment",
@@ -48,15 +47,60 @@ class VideoTransferImplService(video_transfer_pb2_grpc.VideoTransferServiceServi
             c="copy"
         ).run()
 
+        # Distribute the list of files to all nodes on the network.
+        # Track via a hashmap for now (Non Persistent)
+        segment_files = sorted([file for file in os.listdir(segment_dir)])
+
+        # Round Robin Assigment : Each segment gets a node
+        segment_assignment = dict()
+        for node in self.node.network:
+            segment_assignment[node] = set()
+        network_index = 0
+        for segment in segment_files:
+            node = self.node.network[network_index]
+            segment_assignment[node].add(segment)
+            network_index = (network_index + 1) % len(self.node.network)
+        self.node.video_map[first_chunk.video_name] = segment_assignment
+
+        
+        # Helper function to convert segments into streams
+        async def segment_to_stream(segment_name, video_name):
+            with open(f"{segment_dir}{segment_name}", 'rb') as fp:
+                while chunk := fp.read(1024*1024):
+                    yield video_encode_pb2.EncodeSegmentRequest(video_data=chunk, video_name=video_name, segment_name=segment_name)
+
+
+        # Create stub on each network node to call encode service with each segment file as argument.
+        for node in self.node.network:
+            async with grpc.aio.insecure_channel(node) as channel:
+                stub = video_encode_pb2_grpc.SegmentEncodeServiceStub(channel)
+                for segment in segment_assignment[node]:
+                    response = await stub.EncodeVideoSegment(segment_to_stream(segment_name=segment, video_name=first_chunk.video_name), timeout=5)
+
         return video_transfer_pb2.UploadResponse(ack=True, status_msg="File Upload Completed")
+
 
     # Gather all encoded segments and stitch it back together
     def Download(self, request, context):
         pass
 
-class VideoEncodeImplService(video_encode_pb2_grpc.VideoEncodeServiceServicer):
-    def EncodeVideoSegment(self, request_iterator, context):
-        pass
+
+
+
+class SegmentEncodeImplService(video_encode_pb2_grpc.SegmentEncodeServiceServicer):
+    def __init__(self, node):
+        self.node = node
+
+    async def EncodeVideoSegment(self, request_iterator, context):
+        first_chunk = await anext(request_iterator)
+        encode_dir = f"{self.node.directory}/encode/{first_chunk.video_name}/" 
+        os.makedirs(encode_dir, exist_ok=True)
+        segment_file_path = f"{encode_dir}/{first_chunk.segment_name}"
+        with open(segment_file_path, "wb") as fp:
+            fp.write(first_chunk.video_data)
+            async for chunk in request_iterator:
+                fp.write(chunk.video_data)
+        return video_encode_pb2.EncodeSegmentResponse(success=True, status_message="Done", segment_name=first_chunk.segment_name) 
 
     def RetrieveVideoSegment(self, request, context):
         pass 
@@ -68,15 +112,20 @@ class Node():
         self.ip = ip
         self.port = port
         self.directory = f"/tmp/{self.port}" 
-        self.network = ["0.0.0.0:50051",
-                        "0.0.0.0:50052",]
-
         os.makedirs(self.directory, exist_ok=True)
+
+        # TODO: move this to a configurable file
+        self.network = ["0.0.0.0:50051",
+                        "0.0.0.0:50052"]
+
+        # TODO: flush map to disk for persistence.
+        self.video_map = dict()
+
 
     async def serve(self):
         server = grpc.aio.server() 
         video_transfer_pb2_grpc.add_VideoTransferServiceServicer_to_server(VideoTransferImplService(self), server)
-        video_encode_pb2_grpc.add_VideoEncodeServiceServicer_to_server(VideoEncodeImplService(), server)
+        video_encode_pb2_grpc.add_SegmentEncodeServiceServicer_to_server(SegmentEncodeImplService(self), server)
         server.add_insecure_port(f"{self.ip}:{self.port}")
         logging.info(f"Starting server on {self.ip}:{self.port}")
         await server.start()
