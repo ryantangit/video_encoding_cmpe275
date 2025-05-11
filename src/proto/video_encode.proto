@@ -1,0 +1,32 @@
+syntax = "proto3";
+// The purpose of this proto buffer file is to define the standard of communication between Master and Worker
+// Feedback regarding field adjustment / rpc adjustments via @ryantangit or @birtext in class discord.
+
+service VideoEncodeService {
+	rpc EncodeVideoSegment(stream EncodeVideoRequest) returns (EncodeVideoResponse) {}
+	rpc RetrieveVideoSegmentd(RetrieveVideoRequest) returns (stream RetrieveVideoResponse) {}
+}
+
+message EncodeVideoRequest {
+	bytes video_data = 1;
+	int32 chunk_id = 2;
+	string video_name = 3;
+}
+
+message EncodeVideoResponse {
+	bool success = 1;
+	string status_message = 2;
+	int32 chunk_id = 3;
+	string video_name = 4;
+}
+
+message RetrieveVideoRequest {
+	string video_name = 1;
+	int32 chunk_id = 2;
+}
+
+message RetrieveVideoResponse {
+	bytes video_data = 1;	
+	string video_name = 2;	
+	int32 chunk_id = 3;
+}

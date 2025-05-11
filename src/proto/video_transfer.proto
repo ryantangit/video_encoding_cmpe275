@@ -1,0 +1,33 @@
+syntax = "proto3";
+// The purpose of this proto buffer file is to define the standard of communication between Client and Master
+// Feedback regarding field adjustment / rpc adjustments via @ryantangit or @birtext in class discord.
+
+service VideoTransferService {
+	rpc Upload(stream UploadRequest) returns (UploadResponse) {}
+	rpc Download(DownloadRequest) returns (stream DownloadResponse) {}
+}
+
+
+//Request to upload to master the video to be encoded
+message UploadRequest {
+	bytes video_data = 1;
+	string video_name = 2;
+}
+
+//Response to master upload
+message UploadResponse {
+	bool ack = 1;
+	string status_msg = 2;
+}
+
+
+//Request for the encoded video
+message DownloadRequest {
+	string video_name = 1;
+}
+
+
+//Response for encoded video
+message DownloadResponse {
+	bytes video_data = 1;
+}
