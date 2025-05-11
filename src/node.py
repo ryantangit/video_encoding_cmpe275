@@ -1,6 +1,5 @@
 import grpc
 import asyncio
-import aiofiles
 import argparse
 import logging
 import os
@@ -63,20 +62,29 @@ class VideoTransferImplService(video_transfer_pb2_grpc.VideoTransferServiceServi
         self.node.video_map[first_chunk.video_name] = segment_assignment
 
         
+
         # Helper function to convert segments into streams
         async def segment_to_stream(segment_name, video_name):
             with open(f"{segment_dir}{segment_name}", 'rb') as fp:
                 while chunk := fp.read(1024*1024):
                     yield video_encode_pb2.EncodeSegmentRequest(video_data=chunk, video_name=video_name, segment_name=segment_name)
 
-
-        # Create stub on each network node to call encode service with each segment file as argument.
-        for node in self.node.network:
+        # Helper to encode assigned segments on each node. Run via asyncio's gather
+        async def encode_on_node(node):
             async with grpc.aio.insecure_channel(node) as channel:
                 stub = video_encode_pb2_grpc.SegmentEncodeServiceStub(channel)
+                node_tasks = []
                 for segment in segment_assignment[node]:
-                    response = await stub.EncodeVideoSegment(segment_to_stream(segment_name=segment, video_name=first_chunk.video_name), timeout=5)
+                    # Timeout in this instance refers to how much time per process. Had it at 5 seconds, but might be too little. Bumped to 90 seconds for now.
+                    node_tasks.append(stub.EncodeVideoSegment(segment_to_stream(segment_name=segment, video_name=first_chunk.video_name), timeout=90))
+                return await asyncio.gather(*node_tasks)
 
+
+        # Create stub on each network node to call encode service with each segment file as argument, done in parallel io calls.
+        encoding_task = []
+        for node in self.node.network:
+            encoding_task.append(encode_on_node(node))
+        await asyncio.gather(*encoding_task)
         return video_transfer_pb2.UploadResponse(ack=True, status_msg="File Upload Completed")
 
 
@@ -100,6 +108,10 @@ class SegmentEncodeImplService(video_encode_pb2_grpc.SegmentEncodeServiceService
             fp.write(first_chunk.video_data)
             async for chunk in request_iterator:
                 fp.write(chunk.video_data)
+
+        encode_file_path = f"{encode_dir}encoded_{first_chunk.segment_name}"
+        ffmpeg.input(segment_file_path).output(encode_file_path, vcodec='libx264', crf=28, preset='fast').overwrite_output().run()
+
         return video_encode_pb2.EncodeSegmentResponse(success=True, status_message="Done", segment_name=first_chunk.segment_name) 
 
     def RetrieveVideoSegment(self, request, context):
@@ -114,9 +126,10 @@ class Node():
         self.directory = f"/tmp/{self.port}" 
         os.makedirs(self.directory, exist_ok=True)
 
+        # Currently for workers, should not include master node -> troll but my master can't handle load atm.
         # TODO: move this to a configurable file
-        self.network = ["0.0.0.0:50051",
-                        "0.0.0.0:50052"]
+        self.network = ["0.0.0.0:50052",
+                        "0.0.0.0:50053"]
 
         # TODO: flush map to disk for persistence.
         self.video_map = dict()
