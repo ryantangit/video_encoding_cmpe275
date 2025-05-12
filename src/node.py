@@ -61,8 +61,6 @@ class VideoTransferImplService(video_transfer_pb2_grpc.VideoTransferServiceServi
             network_index = (network_index + 1) % len(self.node.network)
         self.node.video_map[first_chunk.video_name] = segment_assignment
 
-        
-
         # Helper function to convert segments into streams
         async def segment_to_stream(segment_name, video_name):
             with open(f"{segment_dir}{segment_name}", 'rb') as fp:
@@ -76,9 +74,9 @@ class VideoTransferImplService(video_transfer_pb2_grpc.VideoTransferServiceServi
                 node_tasks = []
                 for segment in segment_assignment[node]:
                     # Timeout in this instance refers to how much time per process. Had it at 5 seconds, but might be too little. Bumped to 90 seconds for now.
+                    # Update: it was timing out because master node also handled encoding requests and it would crash. 
                     node_tasks.append(stub.EncodeVideoSegment(segment_to_stream(segment_name=segment, video_name=first_chunk.video_name), timeout=90))
                 return await asyncio.gather(*node_tasks)
-
 
         # Create stub on each network node to call encode service with each segment file as argument, done in parallel io calls.
         encoding_task = []
@@ -89,11 +87,33 @@ class VideoTransferImplService(video_transfer_pb2_grpc.VideoTransferServiceServi
 
 
     # Gather all encoded segments and stitch it back together
-    def Download(self, request, context):
-        pass
+    async def Download(self, request, context):
+        download_dir = f"{self.node.directory}/download/{request.video_name}/"
+        os.makedirs(download_dir, exist_ok=True)
+        segment_assignment = self.node.video_map[request.video_name]
+        
+        for node in segment_assignment: 
+            async with grpc.aio.insecure_channel(node) as channel:
+                stub = video_encode_pb2_grpc.SegmentEncodeServiceStub(channel)               
+                for segment in segment_assignment[node]:
+                    with open(f"{download_dir}{segment}", "wb") as fp:
+                        async for response in stub.RetrieveVideoSegment(video_encode_pb2.RetrieveSegmentRequest(video_name=request.video_name, segment_name=segment)):
+                            fp.write(response.video_data)
+        
 
+        segment_files = sorted([file for file in os.listdir(download_dir)])
+        list_file_path = os.path.join(download_dir, "segments.txt")
+        with open(list_file_path, "w") as f:
+            for seg in segment_files:
+                f.write(f"file '{seg}'\n")
+        
+        encoded_video = f"{download_dir}/encoded.mp4"
+        ffmpeg.input(list_file_path, format='concat', safe=0).output(
+        encoded_video, c="copy").run()
 
-
+        with open(encoded_video, "rb") as fp:
+            while chunk := fp.read(1024*1024):
+                yield video_transfer_pb2.DownloadResponse(video_data=chunk)
 
 class SegmentEncodeImplService(video_encode_pb2_grpc.SegmentEncodeServiceServicer):
     def __init__(self, node):
@@ -115,9 +135,11 @@ class SegmentEncodeImplService(video_encode_pb2_grpc.SegmentEncodeServiceService
         return video_encode_pb2.EncodeSegmentResponse(success=True, status_message="Done", segment_name=first_chunk.segment_name) 
 
     def RetrieveVideoSegment(self, request, context):
-        pass 
-
-    
+        encode_file_path = f"{self.node.directory}/encode/{request.video_name}/encoded_{request.segment_name}"
+        print("Retrieve Video Segment", encode_file_path)
+        with open(encode_file_path, 'rb') as fp:
+            while chunk := fp.read(1024*1024):
+                yield video_encode_pb2.RetrieveSegmentResponse(video_data=chunk)
 
 class Node():
     def __init__(self, ip, port):

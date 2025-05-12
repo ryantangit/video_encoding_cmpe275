@@ -1,17 +1,10 @@
 # Compiled protobuffer
 *_pb2*
 
-
-
-
-
-
-
-
-
+# mp4 file end result
+encoded_test.mp4
 
 # FROM: https://github.com/github/gitignore/blob/main/Python.gitignore
-
 #Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
